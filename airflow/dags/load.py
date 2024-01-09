@@ -34,42 +34,67 @@ def load_authors(authors, chunk_id):
     "LOAD CSV WITH HEADERS FROM 'file:///" + f'/authors_{chunk_id}.csv' + "' AS csvLine MERGE (p:Author {name: csvLine.name}) ON CREATE SET p.id = csvLine.id")
 
 
-# TODO: Load submission to graph database.
 def load_submissions(submissions, chunk_id):
+  neo4j_nodes_file = NEO4J_FOLDER + f'/submissions_{chunk_id}.csv'
+  neo4j_relations_file = NEO4J_FOLDER + f'/author_submissions_{chunk_id}.csv'
   sql_file = SQL_FOLDER + f'/submissions_{chunk_id}.sql'
-  with open(sql_file, 'w') as f:
-    for submission in submissions:
-      title_escaped = escape_sql_string(submission.title)
-      abstract_escaped = escape_sql_string(submission.abstract)
-      authors_values = ','.join([f'((SELECT author_id FROM project.author_alias WHERE name = \'{escape_sql_string(author)}\'), (SELECT id FROM project.submission WHERE doi = \'{submission.doi}\'))' for author in submission.authors])
-      submitter_id = f'(SELECT author_id from project.author_alias where name = \'{submission.submitter}\')'
-      f.write(
-        f"INSERT INTO project.summary (id, abstract, category)\n"
-        f"VALUES ('{submission.summary_id}', '{abstract_escaped}', '{submission.categories}') ON CONFLICT (id) DO UPDATE SET category = excluded.category;\n"
-        f"INSERT INTO project.submission (id, doi, title, date, summary_id, \"submitterId\")\n"
-        f"VALUES ('{submission.id}', '{submission.doi}', '{title_escaped}', '{submission.update_date}', '{submission.summary_id}', {submitter_id}) ON CONFLICT (doi) DO UPDATE SET doi = excluded.doi, title = excluded.title, date = excluded.date;\n"
-        f"INSERT INTO project.author_submission (\"authorId\", \"submissionId\")\n"
-        f"VALUES {authors_values} ON CONFLICT DO NOTHING;\n"
-      )
+  with open(sql_file, 'w') as fsql:
+    with open(neo4j_nodes_file, 'w') as fn4j_node:
+      with open(neo4j_relations_file, 'w') as fn4j_rel:
+        fn4j_node.write('id,title,doi\n')
+        fn4j_rel.write('submissionId,name,type\n')
+        for submission in submissions:
+          title_escaped = escape_sql_string(submission.title)
+          abstract_escaped = escape_sql_string(submission.abstract)
+          authors_values = ','.join([f'((SELECT author_id FROM project.author_alias WHERE name = \'{escape_sql_string(author)}\'), (SELECT id FROM project.submission WHERE doi = \'{submission.doi}\'))' for author in submission.authors])
+          submitter_id = f'(SELECT author_id from project.author_alias where name = \'{submission.submitter}\')'
+          fsql.write(
+            f"INSERT INTO project.summary (id, abstract, category)\n"
+            f"VALUES ('{submission.summary_id}', '{abstract_escaped}', '{submission.categories}') ON CONFLICT (id) DO UPDATE SET category = excluded.category;\n"
+            f"INSERT INTO project.submission (id, doi, title, date, summary_id, \"submitterId\")\n"
+            f"VALUES ('{submission.id}', '{submission.doi}', '{title_escaped}', '{submission.update_date}', '{submission.summary_id}', {submitter_id}) ON CONFLICT (doi) DO UPDATE SET doi = excluded.doi, title = excluded.title, date = excluded.date;\n"
+            f"INSERT INTO project.author_submission (\"authorId\", \"submissionId\")\n"
+            f"VALUES {authors_values} ON CONFLICT DO NOTHING;\n"
+          )
+          fn4j_node.write(f"{submission.id},{title_escaped},{submission.doi}\n")
+          for author in submission.authors:
+            fn4j_rel.write(f"{submission.id},{escape_sql_string(author)},AUTHORED\n")
+          fn4j_rel.write(f"{submission.id},{escape_sql_string(submission.submitter)},SUBMITTED\n")
+
   execute_sql(sql_file)
+  execute_neo4j("LOAD CSV WITH HEADERS FROM 'file:///" + f'/submissions_{chunk_id}.csv' + "' AS csvLine "
+                "MERGE (s:Submission {title: csvLine.title, doi: csvLine.doi}) ON CREATE SET s.id = csvLine.id")
+  execute_neo4j("LOAD CSV WITH HEADERS FROM 'file:///" + f'/author_submissions_{chunk_id}.csv' + "' AS csvLine "
+                "MATCH (a:Author {name: csvLine.name}), (s:Submission {id: csvLine.submissionId}) " +
+                "FOREACH(ignore IN CASE WHEN csvLine.type = 'SUBMITTED' THEN [1] ELSE [] END | " +
+                "MERGE (a)-[:SUBMITTED]->(s)) " +
+                "FOREACH(ignore IN CASE WHEN csvLine.type = 'AUTHORED' THEN [1] ELSE [] END | " +
+                "MERGE (a)-[:AUTHORED]->(s))"
+                )
 
 
 def load_citations(citation_publications_df, chunk_id):
   from airflow.providers.postgres.hooks.postgres import PostgresHook
 
+  neo4j_file = NEO4J_FOLDER + f'/citations_{chunk_id}.csv'
   sql_file = SQL_FOLDER + f'/citations_{chunk_id}.sql'
-  with open(sql_file, 'w') as f:
-    for _, row in citation_publications_df.iterrows():
-      id = uuid.uuid4()
-      authors = escape_sql_string(' '.join(row['cited_authors']))
-      title = escape_sql_string(row['cited_article_title'])
-      f.write(
-        f"INSERT INTO project.citation (id, doi, title, year, authors)\n"
-        f"VALUES ('{id}', '{row['cited_doi']}', '{title}', '{row['cited_publication_year']}', '{authors}') ON CONFLICT (doi) DO NOTHING;\n"
-        f"INSERT INTO project.citation_submission (\"citationId\", \"submissionId\")\n"
-        f"VALUES ((SELECT id from project.citation where doi = '{row['cited_doi']}'), '{row['id']}') ON CONFLICT DO NOTHING;\n"
-      )
+  with open(sql_file, 'w') as fsql:
+    with open(neo4j_file, 'w') as fn4j:
+      fn4j.write('id,title,doi\n')
+      for _, row in citation_publications_df.iterrows():
+        id = uuid.uuid4()
+        authors = escape_sql_string(' '.join(row['cited_authors']))
+        title = escape_sql_string(row['cited_article_title'])
+        fsql.write(
+          f"INSERT INTO project.citation (id, doi, title, year, authors)\n"
+          f"VALUES ('{id}', '{row['cited_doi']}', '{title}', '{row['cited_publication_year']}', '{authors}') ON CONFLICT (doi) DO NOTHING;\n"
+          f"INSERT INTO project.citation_submission (\"citationId\", \"submissionId\")\n"
+          f"VALUES ((SELECT id from project.citation where doi = '{row['cited_doi']}'), '{row['id']}') ON CONFLICT DO NOTHING;\n"
+        )
+        fn4j.write(f"{id},{title},{row['cited_doi']}\n")
   execute_sql(sql_file)
+  execute_neo4j(
+    "LOAD CSV WITH HEADERS FROM 'file:///" + f'/citations_{chunk_id}.csv' + "' AS csvLine MERGE (c:Citation {title: csvLine.title, doi: csvLine.doi}) ON CREATE SET c.id = csvLine.id")
 
   postgres_hook = PostgresHook('dwh_pg')
   engine = postgres_hook.get_sqlalchemy_engine()
@@ -81,7 +106,7 @@ def escape_sql_string(value):
   """Escape single quotes in a string for SQL insertion."""
   if value is None:
     return None
-  return value.replace("'", "''")
+  return value.replace("'", "''").replace('\n', ' ').replace('"', ' ')
 
 
 def load_kaggle_data_chunks(connection_id, schema, kaggle_file):
